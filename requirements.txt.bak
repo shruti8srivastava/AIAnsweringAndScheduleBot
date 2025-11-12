@@ -1,0 +1,9 @@
+Flask==3.0.0
+twilio==9.2.3
+google-api-python-client==2.149.0
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-cloud-firestore==2.16.0
+langchain==0.3.7
+openai==1.52.2
+pytz==2024.2
