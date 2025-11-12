@@ -323,7 +323,7 @@ def run_agent_turn(call_sid: str, user_text: str) -> str:
             history_lines.append(f"Assistant: {h['ai']}")
     context = "\n".join(history_lines)
     prompt = f"{AGENT_SYSTEM_PROMPT}\nConversation so far:\n{context}\nUser just said: {user_text}"
-    agent = initialize_agent(tools, llm, agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
+    agent = initialize_agent(tools, llm, agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True,handle_parsing_errors=True)
     try:
         result = agent.invoke({"input": prompt})
         spoken = result.get("output", result) if isinstance(result, dict) else result
