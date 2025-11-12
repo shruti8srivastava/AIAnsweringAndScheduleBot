@@ -1,3 +1,413 @@
+import os, json, re, base64
+from datetime import datetime as dt, timedelta
+from typing import List, Dict, Any
+from flask import Flask, request, Response
+import pytz
+
+# -------------------- Globals --------------------
+_initialized = False
+twilio_client = None
+db = None
+llm = None
+calendar_service = None
+gmail_service = None
+LOCAL_TZ = None
+DEFAULT_TZ = None
+OWNER_EMAIL = None
+BUSINESS_HOURS = (9, 18)
+MEETING_DURATION_MIN = 30
+
+app = Flask(__name__)
+
+# -------------------- Health --------------------
+@app.route("/")
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+
+# -------------------- Lazy init --------------------
+@app.before_request
+def init_once():
+    """Load secrets and init clients once per container."""
+    global _initialized
+    global LOCAL_TZ, twilio_client, db, llm, calendar_service, gmail_service, OWNER_EMAIL, DEFAULT_TZ
+    if _initialized:
+        return
+    _initialized = True
+    print("🔥 Warming up dependencies (agentic) ...")
+
+    from google.cloud import secretmanager, firestore
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from twilio.rest import Client as TwilioClient
+    from langchain_openai import ChatOpenAI
+
+    sm = secretmanager.SecretManagerServiceClient()
+    proj = os.environ["GOOGLE_CLOUD_PROJECT"]
+
+    def get_secret(name: str) -> str:
+        resp = sm.access_secret_version(
+            request={"name": f"projects/{proj}/secrets/{name}/versions/latest"}
+        )
+        return resp.payload.data.decode()
+
+    # Secrets
+    OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+    OWNER_EMAIL = get_secret("OWNER_EMAIL")
+    DEFAULT_TZ = get_secret("DEFAULT_TZ") or "America/New_York"
+    TWILIO_ACCOUNT_SID = get_secret("TWILIO_ACCOUNT_SID")
+    TWILIO_AUTH_TOKEN = get_secret("TWILIO_AUTH_TOKEN")
+    TWILIO_NUMBER = get_secret("TWILIO_NUMBER")
+    OAUTH_TOKEN_JSON = json.loads(get_secret("OAUTH_TOKEN_JSON"))
+    _ = json.loads(get_secret("OAUTH_CLIENT_JSON"))  # not used directly here
+
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    LOCAL_TZ = pytz.timezone(DEFAULT_TZ)
+
+    SCOPES = [
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/gmail.send",
+    ]
+
+    creds = Credentials.from_authorized_user_info(
+        {
+            "token": OAUTH_TOKEN_JSON.get("token"),
+            "refresh_token": OAUTH_TOKEN_JSON.get("refresh_token"),
+            "token_uri": OAUTH_TOKEN_JSON.get("token_uri"),
+            "client_id": OAUTH_TOKEN_JSON.get("client_id"),
+            "client_secret": OAUTH_TOKEN_JSON.get("client_secret"),
+            "scopes": OAUTH_TOKEN_JSON.get("scopes"),
+        },
+        scopes=SCOPES,
+    )
+
+    # Clients
+    from google.cloud import firestore
+    calendar_client = build("calendar", "v3", credentials=creds)
+    gmail_client = build("gmail", "v1", credentials=creds)
+    tw_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    firestore_client = firestore.Client()
+    # LLM controller
+    controller = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+
+    # Set globals
+    calendar_service = calendar_client
+    gmail_service = gmail_client
+    twilio_client = tw_client
+    db = firestore_client
+    llm = controller
+
+    print(f"✅ Warm-up complete. OWNER_EMAIL={OWNER_EMAIL}, TZ={DEFAULT_TZ}")
+
+
+# -------------------- TwiML helpers --------------------
+def say_and_gather(text: str) -> str:
+    # Keep responses concise and speakable
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" action="/voice" method="POST" language="en-US" speechTimeout="auto">
+    <Say>{text}</Say>
+  </Gather>
+  <Say>Goodbye.</Say>
+</Response>"""
+
+
+def say_and_hangup(text: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>{text}</Say>
+  <Hangup/>
+</Response>"""
+
+
+# -------------------- Session helpers (Firestore) --------------------
+def load_session(call_sid: str) -> Dict[str, Any]:
+    ref = db.collection("callsessions").document(call_sid)
+    doc = ref.get()
+    if doc.exists:
+        return doc.to_dict()
+    s = {
+        "stage": "agentic",    # single stage; the agent decides next steps
+        "history": [],         # [{user: "...", ai: "..."}]
+        "proposals": [],       # list of ISO datetimes offered
+        "caller": "",
+        "last_tool_result": "",
+    }
+    ref.set(s)
+    return s
+
+
+def save_session(call_sid: str, s: Dict[str, Any]):
+    db.collection("callsessions").document(call_sid).set(s)
+
+
+# -------------------- Calendar + Gmail primitives --------------------
+def freebusy_busy_ranges(day_local: dt):
+    start = LOCAL_TZ.localize(dt(day_local.year, day_local.month, day_local.day, 0, 0, 0)).astimezone(pytz.UTC)
+    end = LOCAL_TZ.localize(dt(day_local.year, day_local.month, day_local.day, 23, 59, 59)).astimezone(pytz.UTC)
+    body = {
+        "timeMin": start.isoformat(),
+        "timeMax": end.isoformat(),
+        "timeZone": DEFAULT_TZ,
+        "items": [{"id": "primary"}],
+    }
+    fb = calendar_service.freebusy().query(body=body).execute()
+    busy = fb["calendars"]["primary"].get("busy", [])
+    ranges = []
+    for b in busy:
+        s = dt.fromisoformat(b["start"].replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+        e = dt.fromisoformat(b["end"].replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+        ranges.append((s, e))
+    return ranges
+
+
+def is_free(candidate: dt, duration_min: int, busy_ranges):
+    end = candidate + timedelta(minutes=duration_min)
+    for (bs, be) in busy_ranges:
+        if not (end <= bs or candidate >= be):
+            return False
+    return True
+
+
+def next_business_slots(day_local: dt, max_slots=8):
+    slots = []
+    day_start = LOCAL_TZ.localize(dt(day_local.year, day_local.month, day_local.day, BUSINESS_HOURS[0], 0, 0))
+    day_end = LOCAL_TZ.localize(dt(day_local.year, day_local.month, day_local.day, BUSINESS_HOURS[1], 0, 0))
+    now_local = LOCAL_TZ.localize(dt.now())
+    t = max(now_local, day_start)
+    while t + timedelta(minutes=MEETING_DURATION_MIN) <= day_end and len(slots) < max_slots:
+        slots.append(t)
+        t += timedelta(minutes=MEETING_DURATION_MIN)
+    return slots
+
+
+def propose_slots(date_hint: str, max_slots=3) -> List[dt]:
+    text = (date_hint or "").lower()
+    today = LOCAL_TZ.localize(dt.now())
+    if "tomorrow" in text:
+        pref = today + timedelta(days=1)
+    else:
+        wmap = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4}
+        target = None
+        for k, v in wmap.items():
+            if k in text:
+                target = v
+                break
+        if target is not None:
+            diff = (target - today.weekday()) % 7
+            pref = today + timedelta(days=diff)
+        else:
+            pref = today
+
+    proposals = []
+    for d in [pref, pref + timedelta(days=1)]:
+        busy = freebusy_busy_ranges(d)
+        for c in next_business_slots(d, max_slots=24):
+            if is_free(c, MEETING_DURATION_MIN, busy):
+                proposals.append(c)
+                if len(proposals) >= max_slots:
+                    return proposals
+    return proposals
+
+
+def create_event(start_local: dt, caller_number: str, subject="Call with Shruti"):
+    end_local = start_local + timedelta(minutes=MEETING_DURATION_MIN)
+    event = {
+        "summary": subject,
+        "description": f"Auto-scheduled by AI assistant.\nCaller: {caller_number}",
+        "start": {"dateTime": start_local.isoformat(), "timeZone": DEFAULT_TZ},
+        "end": {"dateTime": end_local.isoformat(), "timeZone": DEFAULT_TZ},
+    }
+    return calendar_service.events().insert(calendarId="primary", body=event).execute()
+
+
+def gmail_send(to_email: str, subject: str, body: str):
+    from email.mime.text import MIMEText
+    msg = MIMEText(body)
+    msg["to"] = to_email
+    msg["subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+
+# -------------------- Agent tools (LangChain) --------------------
+# We create tools *bound to the specific CallSid* each request,
+# so tools can update & read that call's session in Firestore.
+
+def make_tools_for_call(call_sid: str):
+    from langchain.agents import Tool
+
+    def tool_get_free_slots(input_str: str) -> str:
+        """
+        Input JSON: {"date_hint": "tomorrow|monday|..."}
+        Output JSON: {"slots":[{"iso":"...", "speak":"Thursday 3:00 PM"}]}
+        Also persists proposals in the call session.
+        """
+        try:
+            payload = json.loads(input_str) if input_str else {}
+        except Exception:
+            payload = {"date_hint": input_str}
+        date_hint = payload.get("date_hint", "")
+
+        print(f"🛠 get_free_slots called with date_hint={date_hint}")
+        slots = propose_slots(date_hint, max_slots=3)
+        session = load_session(call_sid)
+        session["proposals"] = [s.isoformat() for s in slots]
+        save_session(call_sid, session)
+
+        out = {
+            "slots": [
+                {"iso": s.isoformat(), "speak": s.strftime("%A %-I:%M %p")}
+                for s in slots
+            ]
+        }
+        print(f"🛠 get_free_slots returning: {out}")
+        return json.dumps(out)
+
+    def tool_book_meeting(input_str: str) -> str:
+        """
+        Input JSON: one of:
+          - {"iso": "<iso-datetime>"}  OR
+          - {"choice": 1}               # 1-based index into previously offered slots
+        Output JSON: {"ok": true, "when":"Thursday 3:00 PM", "event_link": "..."}
+        """
+        try:
+            payload = json.loads(input_str) if input_str else {}
+        except Exception:
+            payload = {}
+
+        session = load_session(call_sid)
+        props = [dt.fromisoformat(p).astimezone(LOCAL_TZ) for p in session.get("proposals", [])]
+
+        chosen = None
+        if "iso" in payload:
+            try:
+                chosen = dt.fromisoformat(payload["iso"]).astimezone(LOCAL_TZ)
+            except Exception:
+                pass
+        elif "choice" in payload and props:
+            idx = int(payload["choice"]) - 1
+            if 0 <= idx < len(props):
+                chosen = props[idx]
+
+        print(f"🛠 book_meeting called with payload={payload}, derived_chosen={chosen}")
+
+        if not chosen:
+            return json.dumps({"ok": False, "error": "No valid slot to book"})
+
+        event = create_event(chosen, session.get("caller", ""))
+        when = chosen.strftime("%A %-I:%M %p")
+        session["last_tool_result"] = {"event_link": event.get("htmlLink", ""), "when": when}
+        save_session(call_sid, session)
+
+        # notify owner by email
+        try:
+            gmail_send(
+                OWNER_EMAIL,
+                "AI Assistant: Meeting booked",
+                f"Caller: {session.get('caller')}\nTime: {when} ({DEFAULT_TZ})\nEvent: {event.get('htmlLink','')}\n",
+            )
+        except Exception as e:
+            print(f"Email error: {e}")
+
+        out = {"ok": True, "when": when, "event_link": event.get("htmlLink", "")}
+        print(f"🛠 book_meeting returning: {out}")
+        return json.dumps(out)
+
+    def tool_send_owner_email(input_str: str) -> str:
+        """
+        Input JSON: {"subject":"...", "body":"..."}
+        """
+        try:
+            payload = json.loads(input_str) if input_str else {}
+        except Exception:
+            payload = {"body": input_str}
+        sub = payload.get("subject", "AI Assistant: Caller update")
+        body = payload.get("body", "")
+        session = load_session(call_sid)
+        body = f"Caller: {session.get('caller')}\n\n{body}"
+        try:
+            gmail_send(OWNER_EMAIL, sub, body)
+            print("🛠 send_owner_email: email sent.")
+            return json.dumps({"ok": True})
+        except Exception as e:
+            print(f"send_owner_email error: {e}")
+            return json.dumps({"ok": False, "error": str(e)})
+
+    def tool_summarize_call(_input: str) -> str:
+        """
+        Summarize the call so far (for logging or email).
+        Output: plain text summary.
+        """
+        session = load_session(call_sid)
+        transcript = "\n".join(
+            [f"User: {h.get('user','')}\nAI: {h.get('ai','')}" for h in session.get("history", [])]
+        )
+        prompt = f"Summarize this call in 3 sentences:\n{transcript}"
+        summary = llm.invoke(prompt).content
+        print(f"🛠 summarize_call: {summary}")
+        return summary
+
+    return [
+        Tool(
+            name="get_free_slots",
+            func=tool_get_free_slots,
+            description=(
+                "Get available meeting time slots. "
+                "Input (JSON): {\"date_hint\":\"tomorrow|monday|...\"}. "
+                "Returns JSON with a 'slots' list; each element has 'iso' and 'speak'. "
+                "ALWAYS call this before booking."
+            ),
+        ),
+        Tool(
+            name="book_meeting",
+            func=tool_book_meeting,
+            description=(
+                "Book one of the previously offered slots. "
+                "Input (JSON): {\"choice\": 1} to pick the 1st offered slot, or {\"iso\":\"<iso-datetime>\"}. "
+                "Returns JSON with 'ok', 'when', 'event_link'."
+            ),
+        ),
+        Tool(
+            name="send_owner_email",
+            func=tool_send_owner_email,
+            description=(
+                "Email the owner (Shruti/Avinash) with any details. "
+                "Input (JSON): {\"subject\":\"...\",\"body\":\"...\"}."
+            ),
+        ),
+        Tool(
+            name="summarize_call",
+            func=tool_summarize_call,
+            description="Summarize the entire call so far in a few sentences for logging or email.",
+        ),
+    ]
+
+
+# -------------------- Agent wrapper --------------------
+AGENT_SYSTEM_PROMPT = """\
+You are Shruti's AI phone receptionist. Speak concisely and professionally.
+Your goals:
+1) Help callers schedule meetings (find availability, propose times, confirm, then book).
+2) If they just want to leave a message, ask for the message and inform you'll pass it on.
+3) If the proposed times do not work, propose different times (call get_free_slots again with a different hint like 'tomorrow' or a weekday).
+4) After booking, let them know it's confirmed and ask if they need anything else.
+5) If they indicate they are done, end the call.
+
+TOOLS:
+- get_free_slots: use this to fetch availability based on a natural date hint. Then read slot options back to the caller (1,2,3).
+- book_meeting: after the caller picks a slot, call it with {"choice":<1|2|3>} or an ISO datetime to book.
+- send_owner_email: use to notify the owner if caller leaves a message or you want to send a summary.
+- summarize_call: use if you want to summarize the call for email body.
+
+When you propose slots, read them as a numbered list like:
+"Option 1: Thursday 3 PM. Option 2: Thursday 4:30 PM. Option 3: Friday 10 AM."
+When the caller picks, map their choice to the correct slot and book.
+
+Return only the sentence(s) that should be SPOKEN to the caller (no JSON in your final text).
+"""
+
 def run_agent_turn(call_sid: str, user_text: str) -> str:
     """
     Build an agent with tools bound to this call, and let it decide the next response.
@@ -41,3 +451,44 @@ def run_agent_turn(call_sid: str, user_text: str) -> str:
     save_session(call_sid, s)
 
     return spoken
+
+
+
+# -------------------- Twilio Voice webhook (agentic) --------------------
+@app.route("/voice", methods=["POST"])
+def voice():
+    call_sid = request.form.get("CallSid", "")
+    from_num = request.form.get("From", "")
+    speech = (request.form.get("SpeechResult") or "").strip()
+
+    print(f"\n📞 CallSid={call_sid} From={from_num}")
+    print(f"🗣  SpeechResult: {speech}")
+
+    s = load_session(call_sid)
+    s["caller"] = from_num
+    if speech:
+        s["history"].append({"user": speech})
+        save_session(call_sid, s)
+
+    # First turn greeting if no speech yet
+    if not speech and len(s.get("history", [])) == 0:
+        greeting = "Hi, this is Shruti's AI assistant. How can I help you today — schedule a meeting or leave a message?"
+        s["history"].append({"ai": greeting})
+        save_session(call_sid, s)
+        return Response(say_and_gather(greeting), mimetype="text/xml")
+
+    # Agent decides what to do
+    spoken = run_agent_turn(call_sid, speech or "")
+    print(f"🗣  Agent says: {spoken}")
+
+    # Basic exit detection to hang up nicely
+    if re.search(r"\b(goodbye|bye|that'?s all|nothing|no thanks)\b", spoken.lower()):
+        return Response(say_and_hangup(spoken), mimetype="text/xml")
+
+    return Response(say_and_gather(spoken), mimetype="text/xml")
+
+
+# -------------------- Entry --------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
