@@ -17,9 +17,11 @@ BUSINESS_HOURS = (9,18)
 MEETING_DURATION_MIN = 30
 
 app = Flask(__name__)
+
 @app.route("/")
 def index():
     return "AI Voice Bot is running", 200
+
 @app.route("/healthz")
 def healthz():
     return "ok", 200
@@ -52,7 +54,7 @@ def init_once():
 
     # -------------------- secrets --------------------
     OPENAI_API_KEY      = get_secret("OPENAI_API_KEY")
-    OWNER_EMAIL         = get_secret("OWNER_EMAIL")            # ✅ assigned after global declaration
+    OWNER_EMAIL         = get_secret("OWNER_EMAIL")
     DEFAULT_TZ          = get_secret("DEFAULT_TZ") or "America/New_York"
     TWILIO_ACCOUNT_SID  = get_secret("TWILIO_ACCOUNT_SID")
     TWILIO_AUTH_TOKEN   = get_secret("TWILIO_AUTH_TOKEN")
@@ -60,7 +62,6 @@ def init_once():
     OAUTH_TOKEN_JSON    = json.loads(get_secret("OAUTH_TOKEN_JSON"))
     CLIENT_JSON         = json.loads(get_secret("OAUTH_CLIENT_JSON"))
 
-    # -------------------- setup --------------------
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
     LOCAL_TZ = pytz.timezone(DEFAULT_TZ)
 
@@ -87,8 +88,7 @@ def init_once():
     db               = firestore.Client()
     llm              = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-    print(f"Warmup complete. OWNER_EMAIL = {OWNER_EMAIL}")
-
+    print(f"Warmup complete. OWNER_EMAIL={OWNER_EMAIL}")
 
 
 # -------------------- Helpers --------------------
@@ -101,6 +101,12 @@ def say_and_gather(text: str) -> str:
   <Say>Goodbye.</Say>
 </Response>"""
 
+def say_and_hangup(text: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>{text}</Say>
+  <Hangup/>
+</Response>"""
 
 def load_session(call_sid: str) -> dict:
     ref = db.collection("callsessions").document(call_sid)
@@ -111,10 +117,8 @@ def load_session(call_sid: str) -> dict:
     ref.set(s)
     return s
 
-
 def save_session(call_sid: str, s: dict):
     db.collection("callsessions").document(call_sid).set(s)
-
 
 def freebusy_busy_ranges(day_local: dt):
     start = LOCAL_TZ.localize(dt(day_local.year, day_local.month, day_local.day, 0,0,0)).astimezone(pytz.UTC)
@@ -130,14 +134,12 @@ def freebusy_busy_ranges(day_local: dt):
         ranges.append((s,e))
     return ranges
 
-
 def is_free(candidate: dt, duration_min: int, busy_ranges):
     end = candidate + timedelta(minutes=duration_min)
     for (bs, be) in busy_ranges:
         if not (end <= bs or candidate >= be):
             return False
     return True
-
 
 def next_business_slots(day_local: dt, max_slots=8):
     slots = []
@@ -150,11 +152,9 @@ def next_business_slots(day_local: dt, max_slots=8):
         t += timedelta(minutes=MEETING_DURATION_MIN)
     return slots
 
-
 def propose_slots_from_preference(utterance: str, max_slots=3):
     text = (utterance or "").lower()
     today = LOCAL_TZ.localize(dt.now())
-    # simple date inference
     if "tomorrow" in text:
         pref = today + timedelta(days=1)
     else:
@@ -178,7 +178,6 @@ def propose_slots_from_preference(utterance: str, max_slots=3):
                     return proposals
     return proposals
 
-
 def create_event(start_local: dt, caller_number: str, subject="Call with Avinash"):
     end_local = start_local + timedelta(minutes=MEETING_DURATION_MIN)
     event = {
@@ -189,7 +188,6 @@ def create_event(start_local: dt, caller_number: str, subject="Call with Avinash
     }
     return calendar_service.events().insert(calendarId="primary", body=event).execute()
 
-
 def send_email(to_email: str, subject: str, body: str):
     from email.mime.text import MIMEText
     msg = MIMEText(body)
@@ -198,14 +196,16 @@ def send_email(to_email: str, subject: str, body: str):
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
-
 def extract_intent(utterance: str) -> str:
     prompt = f"""Text: {utterance}
-Classify intent as one of: SCHEDULE, MESSAGE.
+Classify intent as one of: SCHEDULE, MESSAGE, EXIT.
 Answer with one token."""
     out = llm.invoke(prompt).content.strip().upper()
-    return "SCHEDULE" if "SCHEDULE" in out else "MESSAGE"
-
+    if "EXIT" in out or any(k in utterance.lower() for k in ["bye", "goodbye", "no thanks", "nothing"]):
+        return "EXIT"
+    if "MESSAGE" in out:
+        return "MESSAGE"
+    return "SCHEDULE"
 
 def choose_slot_from_reply(reply: str, proposals):
     r = (reply or "").lower()
@@ -222,12 +222,6 @@ def choose_slot_from_reply(reply: str, proposals):
             if s.hour == hour: return s
     return None
 
-def say_and_hangup(text: str) -> str:
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>{text}</Say>
-  <Hangup/>
-</Response>"""
 
 # -------------------- Twilio Voice webhook --------------------
 @app.route("/voice", methods=["POST"])
@@ -239,6 +233,12 @@ def voice():
     s = load_session(call_sid)
     s["caller"] = from_num
     s["history"].append({"user": speech})
+
+    # early exit
+    if extract_intent(speech) == "EXIT" or s.get("stage") == "done":
+        s["stage"] = "done"
+        save_session(call_sid, s)
+        return Response(say_and_hangup("Goodbye!"), mimetype="text/xml")
 
     if s["stage"] == "greet" and not speech:
         s["stage"] = "main"
@@ -252,12 +252,16 @@ def voice():
         s["intent"] = intent
         if intent == "SCHEDULE":
             s["stage"] = "propose"
-        else:
+        elif intent == "MESSAGE":
             s["stage"] = "record"
             save_session(call_sid, s)
             return Response(say_and_gather(
                 "Sure. Please state your message and I will email Shruti."
             ), mimetype="text/xml")
+        elif intent == "EXIT":
+            s["stage"] = "done"
+            save_session(call_sid, s)
+            return Response(say_and_hangup("Goodbye!"), mimetype="text/xml")
         save_session(call_sid, s)
 
     if s["stage"] == "propose":
@@ -283,7 +287,7 @@ def voice():
 
         event = create_event(chosen, s.get("caller",""))
         when = chosen.strftime("%A %-I:%M %p")
-        s["stage"] = "booked"
+        s["stage"] = "after_booking"
         s["event_link"] = event.get("htmlLink","")
         save_session(call_sid, s)
         try:
@@ -295,7 +299,7 @@ def voice():
         except Exception as e:
             print("Email error:", e)
         return Response(say_and_gather(
-            f"Done! I’ve booked {when}. I’ll email Shruti a confirmation. Anything else?"
+            f"Done! I’ve booked {when}. I’ll email Shruti a confirmation. Would you like to do anything else?"
         ), mimetype="text/xml")
 
     if s["stage"] == "record":
@@ -304,10 +308,22 @@ def voice():
                        f"Caller: {s.get('caller')}\nMessage: {speech}")
         except Exception as e:
             print("Email error:", e)
-        s["stage"] = "done"
+        s["stage"] = "after_record"
         save_session(call_sid, s)
-        return Response(say_and_gather("Thanks! I’ve sent your message."), mimetype="text/xml")
+        return Response(say_and_gather("Thanks! I’ve sent your message. Would you like to do anything else?"), mimetype="text/xml")
 
+    # handle post-booking or post-record decision
+    if s["stage"] in ("after_booking", "after_record"):
+        if extract_intent(speech) == "EXIT":
+            s["stage"] = "done"
+            save_session(call_sid, s)
+            return Response(say_and_hangup("Alright, goodbye!"), mimetype="text/xml")
+        else:
+            s["stage"] = "main"
+            save_session(call_sid, s)
+            return Response(say_and_gather("Sure, would you like to schedule another meeting or leave a message?"), mimetype="text/xml")
+
+    # fallback
     return Response(say_and_gather("Sorry, could you repeat that?"), mimetype="text/xml")
 
 
